@@ -1,0 +1,5 @@
+list(APPEND SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/ring_buffer.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/ring_buffer.cpp
+)
+set(SOURCES ${SOURCES} PARENT_SCOPE)

@@ -1,0 +1,6 @@
+[submodule "lib/ddui"]
+	path = lib/ddui
+	url = https://github.com/bartjoyce/ddui
+[submodule "lib/portaudio"]
+	path = lib/portaudio
+	url = https://github.com/PortAudio/portaudio.git
