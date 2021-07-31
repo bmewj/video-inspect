@@ -12,11 +12,8 @@
 #include "audio_client.hpp"
 #include <time.h>
 
-constexpr int SAMPLE_RATE = 48000;
-constexpr int BUFFER_SIZE = 64;
-constexpr int FRAME_RATE  = 25;
+constexpr int BUFFER_SIZE = 512;
 constexpr int RING_BUFFER_SIZE = 8192;
-constexpr int NUM_CHANNELS = 2;
 
 static ScrollArea::ScrollAreaState scroll_area_state;
 static VideoReaderState vr_state;
@@ -28,7 +25,8 @@ static std::atomic_int pkt_playing;
 static bool should_close;
 static uint8_t* frame_buffer;
 static std::atomic_bool frame_buffer_filled;
-int image_id;
+static pthread_t decode_thread;
+static int image_id;
 
 struct PacketInfo {
     enum PacketType : unsigned char {
@@ -63,6 +61,9 @@ constexpr float FRAME_HEIGHT = 20;
 constexpr float Y_SPACING = 10;
 constexpr float PREVIEW_SCALE = 0.25;
 
+static void open_file(const char* fname);
+static void close_file();
+
 void update() {
     auto ANIMATION_ID = (void*)0xF0;
     if (pkt_playing != -1 && !ddui::animation::is_animating(ANIMATION_ID)) {
@@ -76,6 +77,12 @@ void update() {
     if (frame_buffer_filled) {
         ddui::update_image(image_id, frame_buffer);
         frame_buffer_filled = false;
+    }
+    
+    if (ddui::has_dropped_files()) {
+        close_file();
+        open_file(ddui::file_drop_state.paths[0]);
+        ddui::consume_dropped_files();
     }
 
     static float second_width = 512.0;
@@ -150,20 +157,22 @@ void update() {
 
     });
 
-    ddui::save();
-    ddui::translate(20, ddui::view.height - 20 - vr_state.height * PREVIEW_SCALE);
-    auto paint = ddui::image_pattern(0,
-                                     0,
-                                     vr_state.width * PREVIEW_SCALE,
-                                     vr_state.height * PREVIEW_SCALE,
-                                     0,
-                                     image_id,
-                                     1.0f);
-    ddui::fill_paint(paint);
-    ddui::begin_path();
-    ddui::rect(0, 0, vr_state.width * PREVIEW_SCALE, vr_state.height * PREVIEW_SCALE);
-    ddui::fill();
-    ddui::restore();
+    if (image_id != -1) {
+        ddui::save();
+        ddui::translate(20, ddui::view.height - 20 - vr_state.height * PREVIEW_SCALE);
+        auto paint = ddui::image_pattern(0,
+                                         0,
+                                         vr_state.width * PREVIEW_SCALE,
+                                         vr_state.height * PREVIEW_SCALE,
+                                         0,
+                                         image_id,
+                                         1.0f);
+        ddui::fill_paint(paint);
+        ddui::begin_path();
+        ddui::rect(0, 0, vr_state.width * PREVIEW_SCALE, vr_state.height * PREVIEW_SCALE);
+        ddui::fill();
+        ddui::restore();
+    }
 }
 
 float draw_packets(std::vector<PacketInfo>* packets, float time_from, float time_to, float second_width, float y, int* next_pkt_hovering) {
@@ -219,7 +228,7 @@ float draw_packets(std::vector<PacketInfo>* packets, float time_from, float time
     return y;
 }
 
-void* packet_player_thread(void* ptr) {
+void* decode_thread_func(void* ptr) {
 
     while (!should_close) {
 
@@ -254,13 +263,13 @@ void* packet_player_thread(void* ptr) {
                     pkt_playing = it - all_packets.begin();
                 }
 
-                assert(vr_state.num_channels == NUM_CHANNELS);
+                int num_channels = vr_state.num_channels;
 
                 int size_1, size_2;
                 float *buffer_1, *buffer_2;
-                rb.write_start(res * NUM_CHANNELS, &size_1, &buffer_1, &size_2, &buffer_2);
-                video_reader_transfer_audio_frame(&vr_state, size_1 / NUM_CHANNELS, buffer_1, size_2 / NUM_CHANNELS, buffer_2);
-                rb.write_end(res * NUM_CHANNELS);
+                rb.write_start(res * num_channels, &size_1, &buffer_1, &size_2, &buffer_2);
+                video_reader_transfer_audio_frame(&vr_state, size_1 / num_channels, buffer_1, size_2 / num_channels, buffer_2);
+                rb.write_end(res * num_channels);
 
             }
         } else {
@@ -327,7 +336,7 @@ void audio_callback(int num_samples, int num_channels, float* buffer) {
     rb.read_end(num_samples * num_channels);
 }
 
-int main(int argc, const char** argv) {
+void open_file(const char* fname) {
 
     should_close = false;
     pkt_requested = -1;
@@ -335,26 +344,17 @@ int main(int argc, const char** argv) {
     pkt_hovering = -1;
     frame_buffer_filled = false;
 
-    // ddui (graphics and UI system)
-    if (!ddui::app_init(700, 600, "Video Inspector", update)) {
-        printf("Failed to init ddui.\n");
-        return 1;
-    }
-
-    // Type faces
-    ddui::create_font("mono", "PTMono.ttf");
-
-    RingBuffer::init(&rb, RING_BUFFER_SIZE);
-
-    audio_client_init(SAMPLE_RATE, BUFFER_SIZE, NUM_CHANNELS, audio_callback);
-
-    auto fname = get_content_filename("demo.mp4");
-    video_reader_open(&vr_state, fname.c_str());
+    video_reader_open(&vr_state, fname);
     if (vr_state.video_stream_index != -1) {
         posix_memalign((void**)&frame_buffer, 128, vr_state.width * vr_state.height * 4);
         image_id = ddui::create_image_from_rgba(vr_state.width, vr_state.height, 0, frame_buffer);
     }
 
+    if (vr_state.audio_stream_index != -1) {
+        audio_client_open(vr_state.sample_rate, BUFFER_SIZE, vr_state.num_channels, audio_callback);
+    }
+
+    // Parse all packets
     duration = 0.0;
     video_reader_read_all_packets(&vr_state, [](bool is_video, bool is_keyframe, int pts, int dts, int dur) {
         auto time_base = is_video ? vr_state.video_time_base : vr_state.audio_time_base;
@@ -383,6 +383,7 @@ int main(int argc, const char** argv) {
     });
 
     int num_streams = audio_packets.empty() || video_packets.empty() ? 1 : 2;
+    duration = duration / num_streams;
     float time = 0.0;
     for (int i = 0; i < all_packets.size(); ++i) {
         auto& pkt = all_packets[i];
@@ -393,17 +394,62 @@ int main(int argc, const char** argv) {
 
     std::sort(video_packets.begin(), video_packets.end(), cmp_pkt_start);
     std::sort(audio_packets.begin(), audio_packets.end(), cmp_pkt_start);
+    
+    pthread_create(&decode_thread, NULL, decode_thread_func, NULL);
+}
 
-    pthread_t thread;
-    pthread_create(&thread, NULL, packet_player_thread, NULL);
+void close_file() {
+    should_close = true;
+    pthread_join(decode_thread, NULL);
+    
+    if (vr_state.audio_stream_index != -1) {
+        audio_client_close();
+    }
+    if (vr_state.video_stream_index != -1) {
+        free(frame_buffer);
+        frame_buffer_filled = false;
+        frame_buffer = NULL;
+        ddui::delete_image(image_id);
+        image_id = -1;
+    }
+
+    video_reader_close(&vr_state);
+
+    should_close = false;
+    pkt_requested = -1;
+    pkt_playing = -1;
+    pkt_hovering = -1;
+    
+
+    video_packets.clear();
+    audio_packets.clear();
+    all_packets.clear();
+}
+
+int main(int argc, const char** argv) {
+
+    // ddui (graphics and UI system)
+    if (!ddui::app_init(700, 600, "Video Inspector", update)) {
+        printf("Failed to init ddui.\n");
+        return 1;
+    }
+
+    // Type faces
+    ddui::create_font("mono", "PTMono.ttf");
+
+    RingBuffer::init(&rb, RING_BUFFER_SIZE);
+    
+    audio_client_init();
+
+    // Open our video file
+    auto fname = get_content_filename("demo.mp4");
+    open_file(fname.c_str());
 
     ddui::app_run();
 
-    should_close = true;
-    pthread_join(thread, NULL);
-
-    video_reader_close(&vr_state);
+    close_file();
     audio_client_destroy();
+    RingBuffer::destroy(&rb);
 
     return 0;
 }

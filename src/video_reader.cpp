@@ -22,8 +22,12 @@ static AVPixelFormat correct_for_deprecated_pixel_format(AVPixelFormat pix_fmt) 
     }
 }
 
-inline static float convert_sample(int32_t sample) {
+inline static float convert_s32(int32_t sample) {
     return (float)sample / -INT32_MIN;
+}
+
+inline static float convert_s16(int16_t sample) {
+    return (float)sample / -INT16_MIN;
 }
 
 bool video_reader_open(VideoReaderState* state, const char* filename) {
@@ -63,7 +67,6 @@ bool video_reader_open(VideoReaderState* state, const char* filename) {
             state->width = av_codec_params->width;
             state->height = av_codec_params->height;
             state->frame_rate = av_stream->avg_frame_rate.num;
-            assert(av_stream->avg_frame_rate.den == 1);
             state->video_time_base = av_stream->time_base;
             continue;
         }
@@ -79,6 +82,12 @@ bool video_reader_open(VideoReaderState* state, const char* filename) {
     }
     if (!audio_codec && !video_codec) {
         printf("Couldn't find valid audio or video stream inside file\n");
+        return false;
+    }
+
+    state->av_packet = av_packet_alloc();
+    if (!state->av_packet) {
+        printf("Couldn't allocate AVPacket\n");
         return false;
     }
 
@@ -104,6 +113,7 @@ bool video_reader_open(VideoReaderState* state, const char* filename) {
             return false;
         }
     } else {
+        state->video_stream_index = -1;
         state->video_codec_ctx = NULL;
         state->video_frame = NULL;
     }
@@ -130,15 +140,25 @@ bool video_reader_open(VideoReaderState* state, const char* filename) {
             printf("Couldn't allocate AVFrame\n");
             return false;
         }
+        
+        // Need to determine sample rate by reading one frame
+        if (state->sample_rate == 0 || state->num_channels == 0) {
+            int res, packet_pts, frame_pts;
+            while ((res = video_reader_next_frame(state, &packet_pts, &frame_pts)) < 0) {}
+            if (res == RECEIVED_NONE) {
+                printf("Couldn't read any frames\n");
+                return false;
+            }
+            
+            state->sample_rate = state->audio_frame->sample_rate;
+            state->num_channels = state->audio_frame->channels;
+            video_reader_seek(state, false, 0);
+        }
+
     } else {
+        state->audio_stream_index = -1;
         state->audio_codec_ctx = NULL;
         state->audio_frame = NULL;
-    }
-
-    state->av_packet = av_packet_alloc();
-    if (!state->av_packet) {
-        printf("Couldn't allocate AVPacket\n");
-        return false;
     }
 
     state->sws_scaler_ctx = NULL;
@@ -232,8 +252,6 @@ int video_reader_next_frame(VideoReaderState* state, int* packet_pts, int* frame
             *packet_pts = state->av_packet->pts;
             *frame_pts = state->audio_frame->pts;
             av_packet_unref(state->av_packet);
-            state->num_channels = state->audio_frame->channels;
-            state->sample_rate  = state->audio_frame->sample_rate;
             return state->audio_frame->nb_samples;
 
         } else {
@@ -284,7 +302,16 @@ static void video_reader_copy_audio_buffer(VideoReaderState* state, int offset, 
         int32_t* ptr_in_end = ptr_in + size * num_channels;
         float*   ptr_out    = buffer;
         while (ptr_in < ptr_in_end) {
-            *ptr_out++ = convert_sample(*ptr_in++);
+            *ptr_out++ = convert_s32(*ptr_in++);
+        }
+    
+    } else if (state->sample_format == AV_SAMPLE_FMT_S16) {
+
+        int16_t* ptr_in     = (int16_t*)frame->data[0] + offset * num_channels;
+        int16_t* ptr_in_end = ptr_in + size * num_channels;
+        float*   ptr_out    = buffer;
+        while (ptr_in < ptr_in_end) {
+            *ptr_out++ = convert_s16(*ptr_in++);
         }
 
     } else if (state->sample_format == AV_SAMPLE_FMT_FLTP) {
