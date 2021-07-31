@@ -176,7 +176,7 @@ void video_reader_read_all_packets(VideoReaderState* state, std::function<void(b
     }
 }
 
-int video_reader_next_frame(VideoReaderState* state, int* pts) {
+int video_reader_next_frame(VideoReaderState* state, int* packet_pts, int* frame_pts) {
 
     // Decode one frame
     int response;
@@ -207,7 +207,8 @@ int video_reader_next_frame(VideoReaderState* state, int* pts) {
                 return RECEIVED_NONE;
             }
 
-            *pts = state->av_packet->pts;
+            *packet_pts = state->av_packet->pts;
+            *frame_pts = state->video_frame->pts;
             av_packet_unref(state->av_packet);
             return RECEIVED_VIDEO;
 
@@ -228,7 +229,8 @@ int video_reader_next_frame(VideoReaderState* state, int* pts) {
                 return RECEIVED_NONE;
             }
 
-            *pts = state->av_packet->pts;
+            *packet_pts = state->av_packet->pts;
+            *frame_pts = state->audio_frame->pts;
             av_packet_unref(state->av_packet);
             state->num_channels = state->audio_frame->channels;
             state->sample_rate  = state->audio_frame->sample_rate;
@@ -245,7 +247,7 @@ int video_reader_next_frame(VideoReaderState* state, int* pts) {
 }
 
 void video_reader_transfer_video_frame(VideoReaderState* state, unsigned char* frame_buffer) {
-    
+
     // Set up sws scaler
     if (!state->sws_scaler_ctx) {
         auto source_pix_fmt = correct_for_deprecated_pixel_format(state->video_codec_ctx->pix_fmt);
@@ -296,7 +298,7 @@ static void video_reader_copy_audio_buffer(VideoReaderState* state, int offset, 
             int channel = i % num_channels;
             buffer[i] = *ptr_ins[channel]++;
         }
-    
+
     } else if (state->sample_format == AV_SAMPLE_FMT_FLT) {
 
         memcpy(buffer,
@@ -321,7 +323,10 @@ bool video_reader_reached_end(VideoReaderState* state) {
 }
 
 void video_reader_seek(VideoReaderState* state, bool video_pts, int pts) {
-    av_seek_frame(state->av_format_ctx, video_pts ? state->video_stream_index : state->audio_stream_index, pts, AVSEEK_FLAG_BACKWARD);
+    av_seek_frame(state->av_format_ctx,
+                  video_pts ? state->video_stream_index : state->audio_stream_index,
+                  pts,
+                  video_pts ? AVSEEK_FLAG_BACKWARD : AVSEEK_FLAG_ANY);
     if (state->audio_codec_ctx) {
         avcodec_flush_buffers(state->audio_codec_ctx);
     }

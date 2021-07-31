@@ -26,6 +26,9 @@ int pkt_hovering;
 static std::atomic_int pkt_requested;
 static std::atomic_int pkt_playing;
 static bool should_close;
+static uint8_t* frame_buffer;
+static std::atomic_bool frame_buffer_filled;
+int image_id;
 
 struct PacketInfo {
     enum PacketType : unsigned char {
@@ -58,15 +61,21 @@ static float draw_packets(std::vector<PacketInfo>* packets, float time_from, flo
 
 constexpr float FRAME_HEIGHT = 20;
 constexpr float Y_SPACING = 10;
+constexpr float PREVIEW_SCALE = 0.25;
 
 void update() {
+    auto ANIMATION_ID = (void*)0xF0;
+    if (pkt_playing != -1 && !ddui::animation::is_animating(ANIMATION_ID)) {
+        ddui::animation::start(ANIMATION_ID);
+    }
+
     if (pkt_requested != -1 && !ddui::mouse_state.pressed) {
         pkt_requested = -1;
     }
 
-    auto ANIMATION_ID = (void*)0xF0;
-    if (pkt_playing != -1 && !ddui::animation::is_animating(ANIMATION_ID)) {
-        ddui::animation::start(ANIMATION_ID);
+    if (frame_buffer_filled) {
+        ddui::update_image(image_id, frame_buffer);
+        frame_buffer_filled = false;
     }
 
     static float second_width = 512.0;
@@ -91,7 +100,7 @@ void update() {
         ddui::fill_color(ddui::rgb(0x333333));
         ddui::rect(0, 0, ddui::view.width, ddui::view.height);
         ddui::fill();
-        
+
         float time_from = scroll_area_state.scroll_x / second_width;
         float time_to   = (scroll_area_state.scroll_x + view_width) / second_width;
         int second_from = floor(time_from);
@@ -107,9 +116,9 @@ void update() {
             ddui::line_to(second_x, ddui::view.width);
         }
         ddui::stroke();
-        
+
         float y = Y_SPACING;
-        
+
         // Draw second numbers
         ddui::fill_color(ddui::rgb(0xffffff));
         ddui::font_face("mono");
@@ -122,38 +131,53 @@ void update() {
             ddui::text(s * second_width + 4, y + asc, second_str, NULL);
         }
         y += lineh + Y_SPACING;
-        
+
         int next_pkt_hovering = -1;
 
         // Draw video packets
         y = draw_packets(&video_packets, time_from, time_to, second_width, y, &next_pkt_hovering);
-        
+
         // Draw audio packets
         y = draw_packets(&audio_packets, time_from, time_to, second_width, y, &next_pkt_hovering);
-        
+
         // Draw mixed in-order packets
         y = draw_packets(&all_packets, time_from, time_to, second_width, y, &next_pkt_hovering);
-        
+
         if (pkt_hovering != next_pkt_hovering) {
             pkt_hovering = next_pkt_hovering;
             ddui::repaint(NULL);
         }
 
     });
+
+    ddui::save();
+    ddui::translate(20, ddui::view.height - 20 - vr_state.height * PREVIEW_SCALE);
+    auto paint = ddui::image_pattern(0,
+                                     0,
+                                     vr_state.width * PREVIEW_SCALE,
+                                     vr_state.height * PREVIEW_SCALE,
+                                     0,
+                                     image_id,
+                                     1.0f);
+    ddui::fill_paint(paint);
+    ddui::begin_path();
+    ddui::rect(0, 0, vr_state.width * PREVIEW_SCALE, vr_state.height * PREVIEW_SCALE);
+    ddui::fill();
+    ddui::restore();
 }
 
 float draw_packets(std::vector<PacketInfo>* packets, float time_from, float time_to, float second_width, float y, int* next_pkt_hovering) {
-    
+
     // Lookup the visible packet range to draw
     int packet_from, packet_to;
     {
         PacketInfo pkt_lower_bound, pkt_upper_bound;
         pkt_lower_bound.time_end = time_from;
         pkt_upper_bound.time_start = time_to;
-        
+
         auto it_from = std::lower_bound(packets->begin(), packets->end(), pkt_lower_bound, cmp_pkt_end);
         auto it_to   = std::upper_bound(it_from,          packets->end(), pkt_upper_bound, cmp_pkt_start);
-        
+
         packet_from = it_from - packets->begin();
         packet_to   = it_to   - packets->begin();
     }
@@ -168,10 +192,10 @@ float draw_packets(std::vector<PacketInfo>* packets, float time_from, float time
         ddui::Color c;
         switch (pkt.type) {
             case PacketInfo::AUDIO:       c = ddui::rgb(0x33ff33); break;
-            case PacketInfo::VIDEO_KEY:   c = ddui::rgb(0x0000ff); break;
-            case PacketInfo::VIDEO_DELTA: c = ddui::rgb(0xff5500); break;
+            case PacketInfo::VIDEO_KEY:   c = ddui::rgb(0x3388ff); break;
+            case PacketInfo::VIDEO_DELTA: c = ddui::rgb(0xff9922); break;
         }
-        
+
         ddui::begin_path();
         ddui::rect(pkt_x, y, pkt_w, FRAME_HEIGHT);
         ddui::stroke_color(c);
@@ -191,7 +215,7 @@ float draw_packets(std::vector<PacketInfo>* packets, float time_from, float time
     }
 
     y += FRAME_HEIGHT + Y_SPACING;
-    
+
     return y;
 }
 
@@ -211,10 +235,54 @@ void* packet_player_thread(void* ptr) {
         auto& pkt = all_packets[pkt_requested];
         video_reader_seek(&vr_state, pkt.type != PacketInfo::AUDIO, pkt.pts);
 
-        while (pkt_requested != -1) {
+        if (pkt.type == PacketInfo::AUDIO) {
+            while (pkt_requested != -1) {
 
-            int res, pts;
-            while ((res = video_reader_next_frame(&vr_state, &pts)) == RECEIVED_VIDEO) {}
+                int res, packet_pts, pts;
+                while ((res = video_reader_next_frame(&vr_state, &packet_pts, &pts)) == RECEIVED_VIDEO) {}
+
+                if (res == RECEIVED_NONE) {
+                    pkt_playing = -1;
+                    pkt_requested = -1;
+                    break;
+                }
+
+                auto it = std::find_if(all_packets.begin(), all_packets.end(), [&](PacketInfo& pkt) {
+                    return pkt.type == PacketInfo::AUDIO && pkt.pts == pts;
+                });
+                if (it != all_packets.end()) {
+                    pkt_playing = it - all_packets.begin();
+                }
+
+                assert(vr_state.num_channels == NUM_CHANNELS);
+
+                int size_1, size_2;
+                float *buffer_1, *buffer_2;
+                rb.write_start(res * NUM_CHANNELS, &size_1, &buffer_1, &size_2, &buffer_2);
+                video_reader_transfer_audio_frame(&vr_state, size_1 / NUM_CHANNELS, buffer_1, size_2 / NUM_CHANNELS, buffer_2);
+                rb.write_end(res * NUM_CHANNELS);
+
+            }
+        } else {
+
+            int res, packet_pts, pts;
+            while ((res = video_reader_next_frame(&vr_state, &packet_pts, &pts)) != RECEIVED_NONE) {
+                if (res != RECEIVED_VIDEO) {
+                    continue;
+                }
+
+                // Find the packet we're looking at
+                auto it = std::find_if(all_packets.begin(), all_packets.end(), [&](PacketInfo& pkt) {
+                    return pkt.type != PacketInfo::AUDIO && pkt.pts == packet_pts;
+                });
+                if (it != all_packets.end()) {
+                    pkt_playing = it - all_packets.begin();
+                }
+
+                if (pts == pkt.pts) {
+                    break;
+                }
+            }
 
             if (res == RECEIVED_NONE) {
                 pkt_playing = -1;
@@ -223,20 +291,16 @@ void* packet_player_thread(void* ptr) {
             }
 
             auto it = std::find_if(all_packets.begin(), all_packets.end(), [&](PacketInfo& pkt) {
-                return pkt.type == PacketInfo::AUDIO && pkt.pts == pts;
+                return pkt.type != PacketInfo::AUDIO && pkt.pts == pts;
             });
             if (it != all_packets.end()) {
                 pkt_playing = it - all_packets.begin();
             }
 
-            assert(vr_state.num_channels == NUM_CHANNELS);
-
-            int size_1, size_2;
-            float *buffer_1, *buffer_2;
-            rb.write_start(res * NUM_CHANNELS, &size_1, &buffer_1, &size_2, &buffer_2);
-            video_reader_transfer_audio_frame(&vr_state, size_1 / NUM_CHANNELS, buffer_1, size_2 / NUM_CHANNELS, buffer_2);
-            rb.write_end(res * NUM_CHANNELS);
-
+            video_reader_transfer_video_frame(&vr_state, frame_buffer);
+            frame_buffer_filled = true;
+            pkt_requested = -1;
+            pkt_playing = -1;
         }
 
     }
@@ -254,7 +318,7 @@ void audio_callback(int num_samples, int num_channels, float* buffer) {
         }
         return;
     }
-    
+
     int size_1, size_2;
     float *buffer_1, *buffer_2;
     rb.read_start(num_samples * num_channels, &size_1, &buffer_1, &size_2, &buffer_2);
@@ -264,6 +328,12 @@ void audio_callback(int num_samples, int num_channels, float* buffer) {
 }
 
 int main(int argc, const char** argv) {
+
+    should_close = false;
+    pkt_requested = -1;
+    pkt_playing = -1;
+    pkt_hovering = -1;
+    frame_buffer_filled = false;
 
     // ddui (graphics and UI system)
     if (!ddui::app_init(700, 600, "Video Inspector", update)) {
@@ -275,12 +345,16 @@ int main(int argc, const char** argv) {
     ddui::create_font("mono", "PTMono.ttf");
 
     RingBuffer::init(&rb, RING_BUFFER_SIZE);
-    
+
     audio_client_init(SAMPLE_RATE, BUFFER_SIZE, NUM_CHANNELS, audio_callback);
 
     auto fname = get_content_filename("demo.mp4");
     video_reader_open(&vr_state, fname.c_str());
-    
+    if (vr_state.video_stream_index != -1) {
+        posix_memalign((void**)&frame_buffer, 128, vr_state.width * vr_state.height * 4);
+        image_id = ddui::create_image_from_rgba(vr_state.width, vr_state.height, 0, frame_buffer);
+    }
+
     duration = 0.0;
     video_reader_read_all_packets(&vr_state, [](bool is_video, bool is_keyframe, int pts, int dts, int dur) {
         auto time_base = is_video ? vr_state.video_time_base : vr_state.audio_time_base;
@@ -307,7 +381,7 @@ int main(int argc, const char** argv) {
         all_packets.push_back(pkt);
         duration += pkt.duration;
     });
-    
+
     int num_streams = audio_packets.empty() || video_packets.empty() ? 1 : 2;
     float time = 0.0;
     for (int i = 0; i < all_packets.size(); ++i) {
@@ -320,10 +394,6 @@ int main(int argc, const char** argv) {
     std::sort(video_packets.begin(), video_packets.end(), cmp_pkt_start);
     std::sort(audio_packets.begin(), audio_packets.end(), cmp_pkt_start);
 
-    should_close = false;
-    pkt_requested = -1;
-    pkt_playing = -1;
-    pkt_hovering = -1;
     pthread_t thread;
     pthread_create(&thread, NULL, packet_player_thread, NULL);
 

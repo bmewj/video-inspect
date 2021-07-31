@@ -43,7 +43,7 @@ constexpr int RECEIVED_NONE = 0;
 
 bool video_reader_open(VideoReaderState* state, const char* filename);
 void video_reader_read_all_packets(VideoReaderState* state, std::function<void(bool is_video, bool is_keyframe, int pts, int dts, int duration)> visit_packet);
-int  video_reader_next_frame(VideoReaderState* state, int* pts);
+int  video_reader_next_frame(VideoReaderState* state, int* packet_pts, int* frame_pts);
 void video_reader_transfer_video_frame(VideoReaderState* state, unsigned char* frame_buffer);
 void video_reader_transfer_audio_frame(VideoReaderState* state, int size_1, float* buffer_1, int size_2, float* buffer_2);
 bool video_reader_reached_end(VideoReaderState* state);
